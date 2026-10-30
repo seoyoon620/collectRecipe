@@ -36,10 +36,16 @@ label.f{display:block;margin:12px 0 4px;font-weight:600}
 #toast.show{opacity:.95}
 small.hint{color:#8a7d6b}
 .foot{margin-top:24px;padding-top:12px;border-top:1px dashed #d9ccb5}
+input[type=password]{width:100%;padding:10px;border:1px solid #d9ccb5;border-radius:10px;font-size:16px;background:#fff;font-family:inherit}
+input[type=file]{width:100%;margin:4px 0}
+.aibox{background:#fff;border:1px dashed #d9772b;border-radius:12px;padding:12px;margin-bottom:12px}
+.ok{background:#e6f4ea}
+.err{background:#fdecea}
+ol.steps li{margin:4px 0}
 </style>
 </head>
 <body>
-<header><a class="logo" href="#/">🍳 레시피 카드</a><a class="btn" href="#/new">+ 새 레시피</a></header>
+<header><a class="logo" href="#/">🍳 레시피 카드</a><span style="display:flex;gap:8px;align-items:center"><a class="btn gray" href="#/settings" aria-label="설정">⚙</a><a class="btn" href="#/new">+ 새 레시피</a></span></header>
 <main id="app"></main>
 <div id="toast"></div>
 
@@ -115,20 +121,33 @@ function wrapText(ctx, text, maxw) {
 }
 
 async function renderCard(rec) {
-  const W = 1080, P = 64, PH = 720;
+  const W = 1080, P = 64;
   const FT = `bold 64px ${FONT}`, FB = `38px ${FONT}`, FS = `32px ${FONT}`;
   const m = document.createElement("canvas").getContext("2d");
   m.font = FT; const tl = wrapText(m, rec.title, W - 2 * P);
   m.font = FB; const bl = wrapText(m, rec.body, W - 2 * P);
   const tags = parseTags(rec.tags).map(t => "#" + t).join(" ");
+  const bmp = rec.photo ? await createImageBitmap(rec.photo) : null;
+  const portrait = !!bmp && bmp.width / bmp.height < 1.1;
+  const PH = portrait ? 900 : 720;
   const H = Math.ceil(PH + P / 2 + tl.length * 82 + (tags ? 50 : 0) + 40 + bl.length * 56 + P + 60);
   const c = document.createElement("canvas"); c.width = W; c.height = H;
   const x = c.getContext("2d");
   x.fillStyle = "#fdf9f1"; x.fillRect(0, 0, W, H);
-  if (rec.photo) {
-    const bmp = await createImageBitmap(rec.photo);
-    const s = Math.max(W / bmp.width, PH / bmp.height), sw = W / s, sh = PH / s;
-    x.drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, W, PH);
+  if (bmp) {
+    const cover = Math.max(W / bmp.width, PH / bmp.height);
+    if (portrait) {
+      // 세로 사진: 흐린 배경 + 전체 장면이 보이게 가운데 배치
+      x.save(); x.beginPath(); x.rect(0, 0, W, PH); x.clip();
+      try { x.filter = "blur(28px) brightness(0.8)"; } catch {}
+      x.drawImage(bmp, (W - bmp.width * cover) / 2, (PH - bmp.height * cover) / 2, bmp.width * cover, bmp.height * cover);
+      x.restore(); x.filter = "none";
+      const fit = Math.min(W / bmp.width, PH / bmp.height), dw = bmp.width * fit, dh = bmp.height * fit;
+      x.drawImage(bmp, (W - dw) / 2, (PH - dh) / 2, dw, dh);
+    } else {
+      const sw = W / cover, sh = PH / cover;
+      x.drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, W, PH);
+    }
   } else {
     x.fillStyle = "#eecda0"; x.fillRect(0, 0, W, PH);
     x.fillStyle = "#fff"; x.font = FB; x.textAlign = "center"; x.textBaseline = "middle";
@@ -153,7 +172,7 @@ async function genPhoto(title, prompt) {
   const p = (prompt || "").trim() || `${title}, delicious homemade dish, appetizing food photography, natural light, top view`;
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(p)}?width=1024&height=768&nologo=true&seed=${Math.floor(Math.random() * 99999)}`;
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 120000);
+  const t = setTimeout(() => ctl.abort(), 60000);
   try {
     const r = await fetch(url, { signal: ctl.signal });
     if (!r.ok) throw new Error("http " + r.status);
@@ -260,6 +279,135 @@ async function importBackup(file) {
   route();
 }
 
+/* ============================== GEMINI START (순수 로직) ============================== */
+const LS = {
+  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+};
+const GBASE = "https://generativelanguage.googleapis.com/v1beta/";
+let _models = null;
+
+function httpErr(r, t) {
+  const e = new Error((t && t.error && t.error.message) || ("HTTP " + r.status));
+  e.status = r.status; return e;
+}
+function friendly(e) {
+  if (!e) return new Error("알 수 없는 오류");
+  if (e instanceof TypeError) return new Error("인터넷에 연결할 수 없어요. 연결을 확인하고 다시 시도하세요.");
+  if (e.status === 429) return new Error("무료 사용량 한도에 걸렸어요. 잠시(1분 정도) 뒤에 다시 시도하세요.");
+  if (e.status === 400 && /api key/i.test(e.message)) return new Error("API 키가 올바르지 않아요. ⚙ 설정에서 다시 확인하세요.");
+  if (e.status === 401 || e.status === 403) return new Error("API 키 권한 오류예요. 키를 다시 확인하세요. (" + e.message + ")");
+  return e;
+}
+
+async function pickModels(key) {
+  const manual = LS.get("rc_model").trim();
+  if (manual) return [manual.startsWith("models/") ? manual : "models/" + manual];
+  if (_models && _models.key === key) return _models.list;
+  const r = await fetch(GBASE + "models?pageSize=200", { headers: { "x-goog-api-key": key } });
+  const t = await r.json().catch(() => ({}));
+  if (!r.ok) throw httpErr(r, t);
+  const ms = (t.models || []).filter(m =>
+    (m.supportedGenerationMethods || []).includes("generateContent") &&
+    /gemini-[\d.]+-flash/.test(m.name) &&
+    !/image|tts|audio|live|embed|robotics|computer|native|thinking|customtools/.test(m.name));
+  const ver = n => parseFloat((n.match(/gemini-([\d.]+)/) || [0, 0])[1]);
+  const score = n => (/preview|exp/.test(n) ? 10 : 0) + (/lite/.test(n) ? 5 : 0);
+  ms.sort((a, b) => score(a.name) - score(b.name) || ver(b.name) - ver(a.name));
+  const list = ms.slice(0, 4).map(m => m.name);
+  list.push("models/gemini-flash-latest");
+  _models = { key, list };
+  return list;
+}
+
+async function geminiGenerate(parts) {
+  const key = LS.get("rc_key").trim();
+  if (!key) throw new Error("API 키가 없어요. ⚙ 설정에서 입력하세요.");
+  let models, lastErr;
+  try { models = await pickModels(key); } catch (e) { throw friendly(e); }
+  for (const m of models) {
+    try {
+      const r = await fetch(GBASE + m + ":generateContent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.2, responseMimeType: "application/json" }
+        })
+      });
+      const t = await r.json().catch(() => ({}));
+      if (!r.ok) throw httpErr(r, t);
+      const txt = ((t.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
+      if (!txt.trim()) throw new Error("AI가 빈 답을 보냈어요. 다시 시도해 보세요.");
+      return txt;
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message))) break;
+    }
+  }
+  throw friendly(lastErr);
+}
+
+function parseJSON(txt) {
+  let t = txt.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try { return JSON.parse(t); } catch {}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  throw new Error("AI 답변을 해석하지 못했어요. 다시 시도해 보세요.");
+}
+
+const strArr = a => (Array.isArray(a) ? a : []).map(x => String(x ?? "").trim()).filter(Boolean);
+function composeBody(j) {
+  const L = [];
+  const sum = String(j.summary || "").trim();
+  if (sum) L.push(sum, "");
+  const ing = strArr(j.ingredients), st = strArr(j.steps), notes = strArr(j.notes);
+  if (ing.length) { L.push("[재료]"); ing.forEach(i => L.push("- " + i)); L.push(""); }
+  if (st.length) { L.push("[만드는 법]"); st.forEach((s, i) => L.push((i + 1) + ". " + s.replace(/^\d+[.)]\s*/, ""))); L.push(""); }
+  const cal = String(j.calories || "").trim();
+  if (cal) { L.push("[열량]", cal, ""); }
+  if (notes.length) { L.push("[참고]"); notes.forEach(n => L.push("- " + n)); L.push(""); }
+  return L.join("\n").trim();
+}
+/* ============================== GEMINI END ============================== */
+
+const SHOT_PROMPT = `이 스크린샷은 요리 영상(쇼츠 등)에 달린 댓글 화면이에요. 댓글에 적힌 레시피를 읽어서 레시피 카드용 JSON으로 정리해 주세요.
+규칙:
+- 스크린샷에 실제로 보이는 내용만 쓰고, 없는 재료·양·시간·열량은 지어내지 마세요. 잘려서 안 보이는 부분은 생략하세요.
+- 한국어와 영어가 중복으로 적혀 있으면 한국어만 쓰세요. 이모지는 넣지 마세요.
+- title은 레시피 내용으로 알 수 있는 요리 이름이에요(영상 자막 문구가 아니라 요리 이름).
+- 재료는 양과 함께 "그릭요거트 100g" 형태로 나열하세요.
+- 만드는 법은 단계별 짧은 문장으로, 번호는 붙이지 마세요.
+- 레시피와 상관없는 문구(주의 문구, 농담 등)는 빼세요.
+JSON 형식(키 이름 그대로):
+{"title":"요리 이름","summary":"한 줄 소개(없으면 빈 문자열)","ingredients":["..."],"steps":["..."],"calories":"열량 정보(없으면 빈 문자열)","notes":["팁/참고(없으면 빈 배열)"],"tags":["짧은 태그 2~4개"],"image_prompt":"완성된 요리를 묘사하는 영어 한 문장 (food photography, top view)","photo_box":[ymin,xmin,ymax,xmax]}
+photo_box: 스크린샷 안에 요리 영상/사진 영역이 보이면 그 영역의 위치(0~1000으로 정규화한 좌표), 안 보이면 null.`;
+
+async function analyzeShot(file) {
+  const bmp = await createImageBitmap(file);
+  const small = await shrinkImage(file, 1600);
+  const b64 = (await blobToDataURL(small)).split(",")[1];
+  const j = parseJSON(await geminiGenerate([{ text: SHOT_PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }]));
+  let crop = null;
+  const bx = j.photo_box;
+  if (Array.isArray(bx) && bx.length === 4 && bx.every(Number.isFinite)) {
+    const [y0, x0, y1, x1] = bx.map(v => Math.max(0, Math.min(1000, v)));
+    const area = (y1 - y0) * (x1 - x0);
+    if (y1 - y0 > 60 && x1 - x0 > 60 && area < 800000) {
+      const sx = x0 / 1000 * bmp.width, sy = y0 / 1000 * bmp.height;
+      const sw = (x1 - x0) / 1000 * bmp.width, sh = (y1 - y0) / 1000 * bmp.height;
+      const k = Math.min(1, 1600 / Math.max(sw, sh));
+      const c = document.createElement("canvas"); c.width = Math.round(sw * k); c.height = Math.round(sh * k);
+      c.getContext("2d").drawImage(bmp, sx, sy, sw, sh, 0, 0, c.width, c.height);
+      crop = await new Promise(r => c.toBlob(r, "image/jpeg", 0.92));
+    }
+  }
+  return {
+    title: String(j.title || "").trim(), body: composeBody(j),
+    tags: strArr(j.tags).join(", "), prompt: String(j.image_prompt || "").trim(), crop
+  };
+}
+
 /* ============================== 화면 ============================== */
 async function viewList() {
   let rows = await dbAll();
@@ -297,19 +445,53 @@ async function viewList() {
 async function viewForm(id) {
   const r = id ? await dbGet(id) : null;
   if (id && !r) { location.hash = "#/"; return; }
+  let crop = null;
+  const hasKey = !!LS.get("rc_key").trim();
   app.innerHTML = `
+    ${r ? "" : `<div class="aibox">
+      <b>📷 스크린샷으로 자동 채우기</b>
+      <small class="hint" style="display:block;margin:4px 0 8px">댓글이 보이는 스크린샷을 고르고 “AI로 정리하기”를 누르면 아래 칸이 자동으로 채워져요. 저장 전에 고칠 수 있어요.</small>
+      ${hasKey ? "" : `<div class="note">먼저 <a href="#/settings">⚙ 설정</a>에서 Gemini API 키를 입력해 주세요.</div>`}
+      <input type="file" id="shot" accept="image/*">
+      <div class="bar"><button type="button" id="ai" ${hasKey ? "" : "disabled"}>AI로 정리하기</button></div>
+      <div id="aistat"></div>
+      <div id="cropbox" hidden>
+        <label class="f"><input type="checkbox" id="usecrop" checked> 스크린샷 속 요리 장면을 카드 사진으로 사용</label>
+        <img id="cropimg" style="width:100%;border-radius:10px">
+      </div>
+    </div>`}
     <form id="f">
       <label class="f">요리 이름</label><input type="text" name="title" required value="${esc(r?.title)}">
-      <label class="f">레시피 (댓글을 그대로 붙여넣기)</label><textarea name="body" required>${esc(r?.body)}</textarea>
+      <label class="f">레시피</label><textarea name="body" required>${esc(r?.body)}</textarea>
       <label class="f">태그 (쉼표/띄어쓰기로 구분)</label><input type="text" name="tags" value="${esc(r?.tags)}" placeholder="다이어트, 아침, 계란">
       <label class="f">AI 사진 설명 <small class="hint">(비워두면 이름으로 자동, 영어가 더 잘 나와요)</small></label>
       <input type="text" name="prompt" value="${esc(r?.prompt)}" placeholder="egg and cucumber cheese taco, top view">
-      <label class="f"><input type="checkbox" name="gen" ${r ? "" : "checked"}> AI 사진 ${r ? "새로 " : ""}생성 <small class="hint">(저장 후 백그라운드에서 만들어져요)</small></label>
+      <label class="f"><input type="checkbox" name="gen" ${r ? "" : "checked"}> AI 사진 ${r ? "새로 " : ""}생성 시도 <small class="hint">(저장 후 뒤에서 시도하고, 안 되면 현재 사진이 그대로 남아요)</small></label>
       <label class="f">또는 내 사진 직접 선택 <small class="hint">(고르면 AI 생성은 건너뛰어요)</small></label>
       <input type="file" name="photoFile" accept="image/*">
       <div class="bar"><button>저장</button><a class="btn gray" href="#/${id ? "r/" + id : ""}">취소</a></div>
     </form>`;
-  document.getElementById("f").onsubmit = async e => {
+  const f = document.getElementById("f");
+  if (!r) {
+    document.getElementById("ai").onclick = async () => {
+      const file = document.getElementById("shot").files[0];
+      const st = document.getElementById("aistat"), btn = document.getElementById("ai");
+      if (!file) { st.innerHTML = `<div class="note">스크린샷을 먼저 선택하세요.</div>`; return; }
+      btn.disabled = true; st.innerHTML = `<div class="note">⏳ AI가 읽는 중이에요… (10~30초)</div>`;
+      try {
+        const out = await analyzeShot(file);
+        f.elements["title"].value = out.title; f.elements["body"].value = out.body;
+        f.elements["tags"].value = out.tags; f.elements["prompt"].value = out.prompt;
+        crop = out.crop;
+        const cb = document.getElementById("cropbox");
+        if (crop) { document.getElementById("cropimg").src = objUrl(crop); cb.hidden = false; } else cb.hidden = true;
+        st.innerHTML = `<div class="note ok">✅ 정리 완료! 아래 내용을 확인하고 저장하세요.${crop ? "" : " (요리 장면은 찾지 못했어요)"}</div>`;
+      } catch (e) {
+        st.innerHTML = `<div class="note err">⚠ ${esc(e.message || e)}</div>`;
+      } finally { btn.disabled = false; }
+    };
+  }
+  f.onsubmit = async e => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const rec = r || { created: new Date().toISOString(), photo: null };
@@ -318,10 +500,38 @@ async function viewForm(id) {
     const file = fd.get("photoFile");
     const hasFile = file && file.size > 0;
     if (hasFile) { try { rec.photo = await shrinkImage(file); } catch { toast("사진을 읽을 수 없어요"); } }
+    else if (crop && document.getElementById("usecrop")?.checked) rec.photo = crop;
     rec.card = await renderCard(rec);
     const nid = await dbPut(rec);
     if (!hasFile && fd.get("gen")) startGen(nid);
     location.hash = "#/r/" + nid;
+  };
+}
+
+async function viewSettings() {
+  app.innerHTML = `
+    <h3>⚙ 설정</h3>
+    <div class="note">스크린샷 자동 정리에 쓰는 <b>Gemini API 키</b>를 입력하세요.<br>
+    ① <b>aistudio.google.com/apikey</b> 접속 → 구글 로그인 → <b>Create API key</b><br>
+    ② 만들어진 키를 복사해서 아래에 붙여넣기</div>
+    <label class="f">Gemini API 키</label>
+    <input type="password" id="k" value="${esc(LS.get("rc_key"))}" placeholder="AIza..." autocomplete="off">
+    <label class="f">모델 이름 <small class="hint">(비워두면 자동 선택 — 보통 그대로 두세요)</small></label>
+    <input type="text" id="m" value="${esc(LS.get("rc_model"))}" placeholder="gemini-2.5-flash">
+    <div class="bar"><button id="sv">저장</button><button class="gray" id="ts">연결 테스트</button><a class="btn gray" href="#/">닫기</a></div>
+    <div id="tst"></div>
+    <small class="hint">키는 이 폰의 브라우저에만 저장되고, GitHub에 올린 앱 파일에는 들어가지 않아요. 무료 사용량 구간에서는 입력한 스크린샷이 구글의 서비스 개선에 쓰일 수 있으니, 개인정보가 보이는 화면은 올리지 마세요.</small>`;
+  const save = () => { LS.set("rc_key", document.getElementById("k").value.trim()); LS.set("rc_model", document.getElementById("m").value.trim()); _models = null; };
+  document.getElementById("sv").onclick = () => { save(); toast("저장했어요"); };
+  document.getElementById("ts").onclick = async () => {
+    save();
+    const st = document.getElementById("tst");
+    if (!LS.get("rc_key")) { st.innerHTML = `<div class="note">키를 먼저 입력하세요.</div>`; return; }
+    st.innerHTML = `<div class="note">⏳ 확인 중…</div>`;
+    try {
+      const list = await pickModels(LS.get("rc_key"));
+      st.innerHTML = `<div class="note ok">✅ 연결 성공! 사용할 모델: ${esc(list.map(x => x.replace("models/", "")).join(" → "))}</div>`;
+    } catch (e) { st.innerHTML = `<div class="note err">⚠ ${esc(friendly(e).message)}</div>`; }
   };
 }
 
@@ -331,7 +541,7 @@ async function viewOne(id) {
   const mine = new Set(parseTags(r.tags));
   const related = (await dbAll()).filter(x => x.id !== id && parseTags(x.tags).some(t => mine.has(t))).slice(0, 6);
   app.innerHTML = `
-    ${pending.has(id) ? `<div class="note">⏳ AI 사진 생성 중… 끝나면 자동으로 바뀌어요 (최대 1~2분). 다른 화면으로 가도 괜찮아요.</div>` : ""}
+    ${pending.has(id) ? `<div class="note">⏳ AI 사진 생성 중… 끝나면 자동으로 바뀌어요 (최대 1분). 다른 화면으로 가도 괜찮아요.</div>` : ""}
     ${failed.has(id) ? `<div class="note">AI 사진 생성에 실패했어요. 인터넷을 확인하고 아래 “AI 사진 다시 생성”을 눌러 주세요.</div>` : ""}
     <div class="card"><img src="${objUrl(r.card)}"></div>
     <div class="bar">
@@ -367,6 +577,7 @@ async function route() {
     if (p[0] === "new") await viewForm(null);
     else if (p[0] === "edit" && p[1]) await viewForm(Number(p[1]));
     else if (p[0] === "r" && p[1]) await viewOne(Number(p[1]));
+    else if (p[0] === "settings") await viewSettings();
     else await viewList();
   } catch (e) {
     console.error(e);
